@@ -76,6 +76,7 @@ type Ops interface {
 	GetEncapsulatedMC(ignitionPath string) (*mcfgv1.MachineConfig, error)
 	OverwriteOsImage(osImage, device string, extraArgs []string) error
 	CopyRegistryData(liveLogger io.Writer, device string) error
+	PrepareBootMediaEject(installDevice string) error
 }
 
 const (
@@ -1348,4 +1349,158 @@ func (o *ops) CopyRegistryData(liveLogger io.Writer, device string) error {
 		}
 	}
 	return nil
+}
+
+// PrepareBootMediaEject injects a dracut shutdown hook that will eject the boot
+// media (CD-ROM, USB, or virtual media) after the root filesystem pivots to
+// initramfs during shutdown. This prevents boot loops on systems without
+// one-shot boot support. Best-effort: failures are logged but never block.
+func (o *ops) PrepareBootMediaEject(installDevice string) error {
+	if o.installerConfig.DryRunEnabled {
+		return nil
+	}
+
+	o.log.Info("Preparing boot media ejection via dracut shutdown hook")
+
+	_, err := o.ExecPrivilegeCommand(nil, "test", "-f", "/usr/bin/eject")
+	if err != nil {
+		o.log.Warn("eject binary not found, skipping boot media ejection")
+		return nil
+	}
+
+	installDevBase := filepath.Base(installDevice)
+
+	device := o.findLiveISODevice(installDevBase)
+	if device == "" {
+		device = o.findOpticalDrive(installDevBase)
+	}
+	if device == "" {
+		o.log.Info("No boot media device detected, skipping eject hook injection")
+		return nil
+	}
+
+	o.log.Infof("Installing dracut shutdown hook to eject %s on reboot", device)
+
+	if _, err := o.ExecPrivilegeCommand(nil, "mkdir", "-p", "/run/initramfs/lib/dracut/hooks/shutdown"); err != nil {
+		o.log.WithError(err).Warn("Failed to create dracut shutdown hooks directory")
+		return nil
+	}
+
+	if _, err := o.ExecPrivilegeCommand(nil, "mkdir", "-p", "/run/initramfs/usr/bin"); err != nil {
+		o.log.WithError(err).Warn("Failed to create initramfs bin directory")
+		return nil
+	}
+
+	if _, err := o.ExecPrivilegeCommand(nil, "cp", "/usr/bin/eject", "/run/initramfs/usr/bin/eject"); err != nil {
+		o.log.WithError(err).Warn("Failed to copy eject binary to initramfs")
+		return nil
+	}
+
+	hookScript := fmt.Sprintf(`#!/bin/sh
+DEVICE="%s"
+[ -z "$DEVICE" ] && return 0
+umount -l "/oldroot/run/initramfs/live" 2>/dev/null
+umount -l "$DEVICE" 2>/dev/null
+if [ -x /usr/bin/eject ]; then
+    /usr/bin/eject "$DEVICE" 2>/dev/null
+fi
+return 0
+`, device)
+
+	hookPath := "/run/initramfs/lib/dracut/hooks/shutdown/99-eject-boot-media.sh"
+	writeCmd := fmt.Sprintf("cat > %s << 'EOFHOOK'\n%sEOFHOOK", hookPath, hookScript)
+	if _, err := o.ExecPrivilegeCommand(nil, "bash", "-c", writeCmd); err != nil {
+		o.log.WithError(err).Warn("Failed to write eject shutdown hook")
+		return nil
+	}
+
+	if _, err := o.ExecPrivilegeCommand(nil, "chmod", "+x", hookPath); err != nil {
+		o.log.WithError(err).Warn("Failed to make shutdown hook executable")
+		return nil
+	}
+
+	o.log.Infof("Dracut shutdown hook installed: %s will be ejected on reboot", device)
+	return nil
+}
+
+func (o *ops) findLiveISODevice(installDevBase string) string {
+	for _, mountpoint := range []string{"/run/initramfs/live", "/run/media/iso"} {
+		out, err := o.ExecPrivilegeCommand(nil, "findmnt", "-n", "-o", "SOURCE", mountpoint)
+		if err != nil || strings.TrimSpace(out) == "" {
+			continue
+		}
+
+		source := strings.TrimSpace(out)
+		devPath := o.resolveParentDevice(source)
+		if devPath == "" {
+			continue
+		}
+		devBase := filepath.Base(devPath)
+
+		if devBase == installDevBase {
+			o.log.Infof("Live ISO device %s is the install target, skipping eject", devPath)
+			return ""
+		}
+
+		if !isValidDevicePath(devPath) {
+			o.log.Warnf("Unexpected device path %q from findmnt, skipping", devPath)
+			continue
+		}
+
+		o.log.Infof("Found live ISO mounted from %s (device %s) at %s", source, devPath, mountpoint)
+		return devPath
+	}
+	return ""
+}
+
+var validDevicePathRe = regexp.MustCompile(`^/dev/[a-zA-Z0-9_-]+$`)
+
+func isValidDevicePath(devPath string) bool {
+	return validDevicePathRe.MatchString(devPath)
+}
+
+// resolveParentDevice uses lsblk to find the parent device of a partition.
+// If the source is already a whole device (e.g. /dev/sr0), returns it as-is.
+func (o *ops) resolveParentDevice(source string) string {
+	out, err := o.ExecPrivilegeCommand(nil, "lsblk", "-ndo", "PKNAME", source)
+	if err != nil {
+		o.log.WithError(err).Debugf("lsblk PKNAME failed for %s, using source directly", source)
+		return source
+	}
+	parent := strings.TrimSpace(out)
+	if parent == "" {
+		return source
+	}
+	return filepath.Join("/dev", parent)
+}
+
+func (o *ops) findOpticalDrive(installDevBase string) string {
+	type lsblkDev struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+	}
+	type lsblkResult struct {
+		Blockdevices []lsblkDev `json:"blockdevices"`
+	}
+
+	out, err := o.ExecPrivilegeCommand(nil, "lsblk", "-ndo", "NAME,TYPE", "--json")
+	if err != nil {
+		o.log.WithError(err).Warn("Failed to list block devices for optical drive scan")
+		return ""
+	}
+
+	var result lsblkResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		o.log.WithError(err).Warn("Failed to parse lsblk output for optical drive scan")
+		return ""
+	}
+
+	for _, dev := range result.Blockdevices {
+		if dev.Type == "rom" && dev.Name != installDevBase {
+			devPath := filepath.Join("/dev", dev.Name)
+			o.log.Infof("Found optical drive: %s", devPath)
+			return devPath
+		}
+	}
+	return ""
 }

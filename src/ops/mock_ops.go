@@ -22,6 +22,7 @@ import (
 type MockOps struct {
 	ctrl     *gomock.Controller
 	recorder *MockOpsMockRecorder
+	isgomock struct{}
 }
 
 // MockOpsMockRecorder is the mock recorder for MockOps.
@@ -293,6 +294,20 @@ func (m *MockOps) OverwriteOsImage(osImage, device string, extraArgs []string) e
 func (mr *MockOpsMockRecorder) OverwriteOsImage(osImage, device, extraArgs any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OverwriteOsImage", reflect.TypeOf((*MockOps)(nil).OverwriteOsImage), osImage, device, extraArgs)
+}
+
+// PrepareBootMediaEject mocks base method.
+func (m *MockOps) PrepareBootMediaEject(installDevice string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "PrepareBootMediaEject", installDevice)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// PrepareBootMediaEject indicates an expected call of PrepareBootMediaEject.
+func (mr *MockOpsMockRecorder) PrepareBootMediaEject(installDevice any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PrepareBootMediaEject", reflect.TypeOf((*MockOps)(nil).PrepareBootMediaEject), installDevice)
 }
 
 // PrepareController mocks base method.

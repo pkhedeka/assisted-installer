@@ -269,6 +269,11 @@ func (i *installer) finalize() error {
 		return errors.Wrap(err, "failed to touch fake reboot marker")
 	}
 
+	// Best-effort: inject dracut shutdown hook to eject boot media on reboot
+	if ejectErr := i.ops.PrepareBootMediaEject(i.Device); ejectErr != nil {
+		i.log.WithError(ejectErr).Warn("Failed to prepare boot media ejection, continuing with reboot")
+	}
+
 	// in case ironic-agent exists on the host we should stop the assisted-agent service instead of rebooting the node.
 	// the assisted agent service stop will signal the ironic agent that we are done so that IPA can continue with its flow.
 	ironicAgentServiceName := "ironic-agent.service"
